@@ -1,2 +1,2 @@
-#define SECRET_SSID "Ipe_amarelo_quarto"
-#define SECRET_PASS "naodouasenha"
+#define SECRET_SSID "nome_do_wifi"
+#define SECRET_PASS "senha_do_wifi"
