@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>IoT Carnes — Temperatura & pH</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    body { margin: 24px; background: #f8fafc; color: #0f172a; }
+    .card { max-width: 1200px; margin: 0 auto 18px; padding: 16px 20px; border: 1px solid #e5e7eb; border-radius: 16px; box-shadow: 0 4px 14px rgba(0,0,0,.06); background: #fff; }
+    h1 { font-size: 22px; margin: 0 0 12px; }
+    h2 { font-size: 18px; margin: 0 0 10px; color: #0f172a; }
+    .muted { font-weight: normal; color: #6b7280; margin-left: 6px; }
+    .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    select, button { padding: 6px 10px; border-radius: 10px; border: 1px solid #d1d5db; background: #fff; }
+    #status { font-size: 12px; color: #6b7280; }
+    canvas { width: 100%; height: 420px; }
+
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(140px, 1fr)); gap: 12px; margin-bottom: 12px; }
+    .stat { border: 1px solid #e2e8f0; border-radius: 14px; padding: 12px; background: #f8fafc; }
+    .stat .label { font-size: 12px; color: #6b7280; margin-bottom: 4px; }
+    .stat .value { font-size: 18px; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>IoT Carnes <small class="muted">v1</small></h1>
+
+    <div class="controls">
+      <label for="range">Período:</label>
+      <select id="range">
+        <option value="6">Últimas 6h</option>
+        <option value="24" selected>Últimas 24h</option>
+        <option value="168">Últimos 7 dias</option>
+        <option value="">Tudo</option>
+      </select>
+      <button id="reload">Atualizar agora</button>
+      <span id="status" aria-live="polite"></span>
+    </div>
+
+    <div class="stats" aria-label="Métricas de Temperatura">
+      <div class="stat">
+        <div class="label">Início</div>
+        <div id="statStart" class="value">—</div>
+      </div>
+      <div class="stat">
+        <div class="label">Final</div>
+        <div id="statEnd" class="value">—</div>
+      </div>
+      <div class="stat">
+        <div class="label">Temperatura Mínima</div>
+        <div id="statMin" class="value">—</div>
+      </div>
+      <div class="stat">
+        <div class="label">Temperatura Máxima</div>
+        <div id="statMax" class="value">—</div>
+      </div>
+    </div>
+
+    <h2>Temperatura × Tempo</h2>
+    <canvas id="tempChart" aria-label="Gráfico de temperatura por tempo" role="img"></canvas>
+  </div>
+
+  <div class="card">
+    <h2>pH × Tempo</h2>
+    <canvas id="phChart" aria-label="Gráfico de pH por tempo" role="img"></canvas>
+  </div>
+
+  <script>
+    let chartTemp, chartPh;
+    const elRange = document.getElementById('range');
+    const elStatus = document.getElementById('status');
+    const btnReload = document.getElementById('reload');
+
+    const elStart = document.getElementById('statStart');
+    const elEnd   = document.getElementById('statEnd');
+    const elMin   = document.getElementById('statMin');
+    const elMax   = document.getElementById('statMax');
+
+    function setStatus(msg) {
+      const now = new Date();
+      elStatus.textContent = msg ? `${msg} • ${now.toLocaleString()}` : '';
+    }
+
+    // -------- Parsers --------
+    function parseBRDate(str) {
+      const m = String(str).trim().match(
+        /^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
+      );
+      if (!m) return null;
+      let [ , d, M, yRaw, h='0', mnt='0', s='0' ] = m;
+      let y = yRaw.length === 2 ? ((Number(yRaw) >= 70 ? '19' : '20') + yRaw) : yRaw;
+      const dt = new Date(Number(y), Number(M)-1, Number(d), Number(h), Number(mnt), Number(s));
+      return isNaN(dt) ? null : dt;
+    }
+    function parseDateFlexibleToMs(v) {
+      if (v instanceof Date) return v.getTime();
+      if (typeof v === 'number' && Number.isFinite(v)) return v;
+      if (typeof v === 'string') {
+        const iso = Date.parse(v);
+        if (Number.isFinite(iso)) return iso;
+        const br = parseBRDate(v);
+        if (br) return br.getTime();
+      }
+      return NaN;
+    }
+    function parseNumberFlexible(v) {
+      if (typeof v === 'number') return v;
+      if (typeof v !== 'string') return NaN;
+      let s = v.trim().replace(/[^\d.,\-]/g, '');
+      if (s.includes(',') && s.includes('.')) s = s.replace(/\./g, '').replace(',', '.');
+      else if (s.includes(',')) s = s.replace(',', '.');
+      return Number(s);
+    }
+    function fmtDate(ms) {
+      const d = new Date(ms);
+      return isNaN(d) ? '—' : d.toLocaleString();
+    }
+
+    function loadData() {
+      setStatus('Carregando...');
+      const val = elRange.value;
+      const sinceHours = val === '' ? null : Number(val);
+
+      // 1) Temperatura
+      google.script.run
+        .withSuccessHandler(raw => {
+          const all = (raw || [])
+            .map(d => ({ x: parseDateFlexibleToMs(d.t), y: parseNumberFlexible(d.temp) }))
+            .filter(p => Number.isFinite(p.x) && Number.isFinite(p.y))
+            .sort((a, b) => a.x - b.x);
+
+          const cutoff = sinceHours ? (Date.now() - sinceHours * 3600 * 1000) : null;
+          const range = cutoff ? all.filter(p => p.x >= cutoff) : all;
+
+          const MIN = -40, MAX = 125;
+          const clean = range.filter(p => p.y >= MIN && p.y <= MAX);
+
+          if (clean.length) {
+            const xs = clean.map(p => p.x);
+            const ys = clean.map(p => p.y);
+            const minX = Math.min(...xs), maxX = Math.max(...xs);
+            const minY = Math.min(...ys), maxY = Math.max(...ys);
+            elStart.textContent = fmtDate(minX);
+            elEnd.textContent   = fmtDate(maxX);
+            elMin.textContent   = `${minY.toFixed(2)} °C`;
+            elMax.textContent   = `${maxY.toFixed(2)} °C`;
+            renderTemp(clean, { minX, maxX });
+          } else {
+            elStart.textContent = elEnd.textContent = elMin.textContent = elMax.textContent = '—';
+            renderTemp([], null);
+          }
+
+          // 2) pH (barras agrupadas)
+          google.script.run
+            .withSuccessHandler(res => {
+              const seriesIn = (res && res.series) ? res.series : [];
+
+              // Monta um dataset por amostra (coluna)
+              const datasets = [];
+              let minX = Infinity, maxX = -Infinity;
+              const allXs = [];
+
+              for (const s of seriesIn) {
+                const pts = (s.data || [])
+                  .map(d => ({ x: parseDateFlexibleToMs(d.t), y: parseNumberFlexible(d.v) }))
+                  .filter(p => Number.isFinite(p.x) && Number.isFinite(p.y))
+                  .sort((a, b) => a.x - b.x);
+
+                const cutoffPH = sinceHours ? (Date.now() - sinceHours * 3600 * 1000) : null;
+                const rangePH = cutoffPH ? pts.filter(p => p.x >= cutoffPH) : pts;
+
+                const cleanPH = rangePH.filter(p => p.y >= 0 && p.y <= 14);
+
+                if (cleanPH.length) {
+                  for (const p of cleanPH) {
+                    if (p.x < minX) minX = p.x;
+                    if (p.x > maxX) maxX = p.x;
+                    allXs.push(p.x);
+                  }
+                }
+
+                datasets.push({
+                  label: s.name,
+                  data: cleanPH,        // [{x:<ms>, y:<pH>}]
+                  parsing: false,
+                  borderWidth: 1,
+                  barThickness: 14
+                });
+              }
+
+              // --- Padding inteligente para não cortar barras ---
+              let padMs = 30 * 60 * 1000; // padrão: 30 min
+              if (allXs.length > 1) {
+                const xsSorted = Array.from(new Set(allXs)).sort((a,b)=>a-b);
+                let minGap = Infinity;
+                for (let i = 1; i < xsSorted.length; i++) {
+                  const gap = xsSorted[i] - xsSorted[i-1];
+                  if (gap < minGap) minGap = gap;
+                }
+                if (isFinite(minGap) && minGap > 0) {
+                  padMs = Math.max(Math.floor(minGap/2), 5 * 60 * 1000); // pelo menos 5 min
+                }
+              }
+              const domain = (isFinite(minX) && isFinite(maxX))
+                ? { minX: minX - padMs, maxX: maxX + padMs }
+                : null;
+
+              renderPhGroupedBars(datasets, domain);
+              setStatus('Atualizado');
+            })
+            .withFailureHandler(() => { renderPhGroupedBars([], null); setStatus('Atualizado'); })
+            .getPhSeries({ maxRows: 50000 });
+
+        })
+        .withFailureHandler(err => {
+          setStatus(`Erro ao carregar temperatura: ${err && err.message ? err.message : err}`);
+          renderTemp([], null);
+          renderPhGroupedBars([], null);
+        })
+        .getTemperatures({ sinceHours, maxRows: 50000 });
+    }
+
+    function renderTemp(points, domain) {
+      const ctx = document.getElementById('tempChart');
+      const ys = points.map(p => p.y);
+      const pad = 1;
+      const yMin = ys.length ? Math.min(...ys) - pad : 0;
+      const yMax = ys.length ? Math.max(...ys) + pad : 1;
+
+      const cfg = {
+        type: 'line',
+        data: { datasets: [{
+          label: 'Temperatura (°C)',
+          data: points,
+          borderColor: '#dc2626',
+          backgroundColor: 'rgba(220,38,38,0.12)',
+          fill: false,
+          tension: 0.2,
+          pointRadius: 0,
+          borderWidth: 2
+        }]},
+        options: {
+          parsing: false,
+          animation: false,
+          interaction: { mode: 'nearest', intersect: false },
+          plugins: {
+            legend: { display: true },
+            tooltip: {
+              callbacks: {
+                title: items => items.length ? new Date(items[0].parsed.x).toLocaleString() : '',
+                label: ctx => ` ${ctx.parsed.y?.toFixed(2)} °C`
+              }
+            }
+          },
+          scales: {
+            x: {
+              type: 'time',
+              min: domain?.minX ?? undefined,
+              max: domain?.maxX ?? undefined,
+              time: {
+                tooltipFormat: 'dd/MM/yyyy HH:mm',
+                displayFormats: { minute: 'HH:mm', hour: 'dd/MM HH:mm', day: 'dd/MM' }
+              },
+              title: { display: true, text: 'Tempo' }
+            },
+            y: {
+              title: { display: true, text: 'Temperatura (°C)' },
+              suggestedMin: yMin,
+              suggestedMax: yMax
+            }
+          }
+        }
+      };
+
+      if (!chartTemp) chartTemp = new Chart(ctx, cfg);
+      else {
+        chartTemp.data.datasets[0].data = points;
+        chartTemp.options.scales.x.min = domain?.minX ?? undefined;
+        chartTemp.options.scales.x.max = domain?.maxX ?? undefined;
+        chartTemp.options.scales.y.suggestedMin = yMin;
+        chartTemp.options.scales.y.suggestedMax = yMax;
+        chartTemp.update('none');
+      }
+    }
+
+    function renderPhGroupedBars(datasets, domain) {
+      const ctx = document.getElementById('phChart');
+
+      const cfg = {
+        type: 'bar',
+        data: { datasets },
+        options: {
+          animation: false,
+          plugins: {
+            legend: { display: true },
+            tooltip: {
+              callbacks: {
+                title: items => items.length ? new Date(items[0].parsed.x).toLocaleString() : '',
+                label: ctx => ` ${ctx.dataset.label}: ${ctx.parsed.y?.toFixed(2)}`
+              }
+            }
+          },
+          scales: {
+            x: {
+              type: 'time',
+              // evita cortes nas extremidades
+              min: domain?.minX ?? undefined,
+              max: domain?.maxX ?? undefined,
+              offset: true,
+              grace: '2%',
+              time: {
+                tooltipFormat: 'dd/MM/yyyy HH:mm',
+                displayFormats: { minute: 'HH:mm', hour: 'dd/MM HH:mm', day: 'dd/MM' }
+              },
+              title: { display: true, text: 'Tempo (data e hora)' },
+              ticks: { maxRotation: 45, minRotation: 45 }
+            },
+            y: {
+              title: { display: true, text: 'pH' },
+              suggestedMin: 0,
+              suggestedMax: 14
+            }
+          }
+        }
+      };
+
+      if (chartPh) { chartPh.destroy(); chartPh = null; }
+      chartPh = new Chart(ctx, cfg);
+    }
+
+    elRange.addEventListener('change', loadData);
+    btnReload.addEventListener('click', loadData);
+    setInterval(loadData, 30000);
+    loadData();
+  </script>
+</body>
+</html>
