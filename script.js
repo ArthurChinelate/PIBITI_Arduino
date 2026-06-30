@@ -1,5 +1,5 @@
 
-const SHEET_ID = '1CN1uV-uqpGTPqyW45edNV6GdJcPiqC9Fj2nj6V7XMa0';
+const SHEET_ID = '0';
 
 // Temperatura: aba com A = timestamp, B = temperatura (cabeçalho na linha 1)
 const TEMP_SHEET_NAME = 'Dados';
